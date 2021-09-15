@@ -11,6 +11,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/q191201771/lal/pkg/rtprtcp"
 	"os"
 
 	"github.com/q191201771/lal/pkg/base"
@@ -34,15 +35,17 @@ func main() {
 	})
 
 	remuxer := remux.NewRtmp2RtspRemuxer(
-		func(rawSdp []byte, sdpCtx sdp.LogicContext) {
+		func(sdpCtx sdp.LogicContext) {
 			// remuxer完成前期工作，生成sdp并开始push
 			nazalog.Info("start push.")
-			err := pushSession.Push(outRtspUrl, rawSdp, sdpCtx)
+			err := pushSession.Push(outRtspUrl, sdpCtx)
 			nazalog.Assert(nil, err)
 			nazalog.Info("push succ.")
 
 		},
-		pushSession.WriteRtpPacket, // remuxer的数据给push发送
+		func(pkt rtprtcp.RtpPacket) {
+			_ = pushSession.WriteRtpPacket(pkt) // remuxer的数据给push发送
+		},
 	)
 
 	nazalog.Info("start pull.")

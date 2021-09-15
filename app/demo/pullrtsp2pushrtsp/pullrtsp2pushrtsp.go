@@ -55,17 +55,15 @@ func main() {
 
 	err := pullSession.Pull(inUrl)
 	nazalog.Assert(nil, err)
-	defer pullSession.Dispose()
-	rawSdp, sdpLogicCtx := pullSession.GetSdp()
+	sdpCtx := pullSession.GetSdp()
 
 	pushSession := rtsp.NewPushSession(func(option *rtsp.PushSessionOption) {
 		option.PushTimeoutMs = 5000
 		option.OverTcp = pushOverTcp != 0
 	})
 
-	err = pushSession.Push(outUrl, rawSdp, sdpLogicCtx)
+	err = pushSession.Push(outUrl, sdpCtx)
 	nazalog.Assert(nil, err)
-	defer pushSession.Dispose()
 
 	go func() {
 		for {
@@ -78,10 +76,13 @@ func main() {
 		}
 	}()
 
-	// 只是为了测试主动关闭session
+	//只是为了测试主动关闭session
 	//go func() {
 	//	time.Sleep(5 * time.Second)
-	//	pullSession.Dispose()
+	//	err := pullSession.Dispose()
+	//	nazalog.Debugf("< pull session dispose. err=%+v", err)
+	//	//err := pushSession.Dispose()
+	//	//nazalog.Debugf("< push session dispose. err=%+v", err)
 	//}()
 
 	for {
@@ -95,7 +96,9 @@ func main() {
 			time.Sleep(1 * time.Second)
 			return
 		case pkt := <-rtpPacketChan:
-			pushSession.WriteRtpPacket(pkt)
+			if err := pushSession.WriteRtpPacket(pkt); err != nil {
+				nazalog.Errorf("write rtp packet failed. err=%+v", err)
+			}
 		}
 	}
 

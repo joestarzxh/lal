@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/q191201771/naza/pkg/nazastring"
@@ -41,17 +42,20 @@ type ClientSession struct {
 	hc             IHandshakeClient
 	peerWinAckSize int
 
-	conn         connection.Connection
-	prevConnStat connection.Stat
-	staleStat    *connection.Stat
-	stat         base.StatSession
-	doResultChan chan struct{}
+	conn                  connection.Connection
+	prevConnStat          connection.Stat
+	staleStat             *connection.Stat
+	stat                  base.StatSession
+	doResultChan          chan struct{}
+	hasNotifyDoResultSucc bool
 
 	// 只有PullSession使用
 	onReadRtmpAvMsg OnReadRtmpAvMsg
 
 	debugLogReadUserCtrlMsgCount int
 	debugLogReadUserCtrlMsgMax   int
+
+	disposeOnce sync.Once
 }
 
 type ClientSessionType int
@@ -113,7 +117,7 @@ func NewClientSession(t ClientSessionType, modOptions ...ModClientSessionOption)
 			StartTime: time.Now().Format("2006-01-02 15:04:05.999"),
 		},
 		debugLogReadUserCtrlMsgMax: 5,
-		hc: hc,
+		hc:                         hc,
 	}
 	nazalog.Infof("[%s] lifecycle new rtmp ClientSession. session=%p", uk, s)
 	return s
@@ -151,17 +155,23 @@ func (s *ClientSession) Flush() error {
 	return s.conn.Flush()
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// IClientSessionLifecycle interface
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Dispose 文档请参考： IClientSessionLifecycle interface
+//
 func (s *ClientSession) Dispose() error {
-	nazalog.Infof("[%s] lifecycle dispose rtmp ClientSession.", s.uniqueKey)
-	if s.conn == nil {
-		return base.ErrSessionNotStarted
-	}
-	return s.conn.Close()
+	return s.dispose(nil)
 }
 
+// WaitChan 文档请参考： IClientSessionLifecycle interface
+//
 func (s *ClientSession) WaitChan() <-chan error {
 	return s.conn.Done()
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 func (s *ClientSession) Url() string {
 	return s.urlCtx.Url
@@ -254,7 +264,11 @@ func (s *ClientSession) doContext(ctx context.Context, rawUrl string) error {
 
 	select {
 	case <-ctx.Done():
+		_ = s.dispose(nil)
 		return ctx.Err()
+	case err := <-errChan:
+		_ = s.dispose(err)
+		return err
 	case <-s.doResultChan:
 		return nil
 	}
@@ -325,8 +339,9 @@ func (s *ClientSession) handshake() error {
 }
 
 func (s *ClientSession) runReadLoop() {
-	// TODO chef: 这里是否应该主动关闭conn，考虑对端发送非法协议数据，增加一个对应的测试看看
-	_ = s.chunkComposer.RunLoop(s.conn, s.doMsg)
+	if err := s.chunkComposer.RunLoop(s.conn, s.doMsg); err != nil {
+		_ = s.dispose(err)
+	}
 }
 
 func (s *ClientSession) doMsg(stream *Stream) error {
@@ -516,10 +531,30 @@ func (s *ClientSession) doProtocolControlMessage(stream *Stream) error {
 }
 
 func (s *ClientSession) notifyDoResultSucc() {
+	// 碰上过对端服务器实现有问题，对于play信令回复了两次相同的结果，我们在这里忽略掉非第一次的回复
+	if s.hasNotifyDoResultSucc {
+		nazalog.Warnf("[%s] has notified do result succ already, ignore it", s.uniqueKey)
+		return
+	}
+	s.hasNotifyDoResultSucc = true
+
 	s.conn.ModWriteChanSize(wChanSize)
 	s.conn.ModWriteBufSize(writeBufSize)
 	s.conn.ModReadTimeoutMs(s.option.ReadAvTimeoutMs)
 	s.conn.ModWriteTimeoutMs(s.option.WriteAvTimeoutMs)
 
 	s.doResultChan <- struct{}{}
+}
+
+func (s *ClientSession) dispose(err error) error {
+	var retErr error
+	s.disposeOnce.Do(func() {
+		nazalog.Infof("[%s] lifecycle dispose rtmp ClientSession. err=%+v", s.uniqueKey, err)
+		if s.conn == nil {
+			retErr = base.ErrSessionNotStarted
+			return
+		}
+		retErr = s.conn.Close()
+	})
+	return retErr
 }

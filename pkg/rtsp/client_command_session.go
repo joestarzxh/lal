@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/q191201771/lal/pkg/base"
@@ -51,7 +52,7 @@ type ClientCommandSessionObserver interface {
 	OnConnectResult()
 
 	// only for PullSession
-	OnDescribeResponse(rawSdp []byte, sdpLogicCtx sdp.LogicContext)
+	OnDescribeResponse(sdpCtx sdp.LogicContext)
 
 	OnSetupWithConn(uri string, rtpConn, rtcpConn *nazanet.UdpConnection)
 	OnSetupWithChannel(uri string, rtpChannel, rtcpChannel int)
@@ -76,13 +77,12 @@ type ClientCommandSession struct {
 	methodGetParameterSupported bool
 	auth                        Auth
 
-	rawSdp      []byte
-	sdpLogicCtx sdp.LogicContext
+	sdpCtx sdp.LogicContext
 
 	sessionId string
 	channel   int
 
-	waitChan chan error
+	disposeOnce sync.Once
 }
 
 type ModClientCommandSessionOption func(option *ClientCommandSessionOption)
@@ -97,16 +97,14 @@ func NewClientCommandSession(t ClientCommandSessionType, uniqueKey string, obser
 		uniqueKey: uniqueKey,
 		observer:  observer,
 		option:    option,
-		waitChan:  make(chan error, 1),
 	}
 	nazalog.Infof("[%s] lifecycle new rtsp ClientCommandSession. session=%p", uniqueKey, s)
 	return s
 }
 
 // only for PushSession
-func (session *ClientCommandSession) InitWithSdp(rawSdp []byte, sdpLogicCtx sdp.LogicContext) {
-	session.rawSdp = rawSdp
-	session.sdpLogicCtx = sdpLogicCtx
+func (session *ClientCommandSession) InitWithSdp(sdpCtx sdp.LogicContext) {
+	session.sdpCtx = sdpCtx
 }
 
 func (session *ClientCommandSession) Do(rawUrl string) error {
@@ -123,17 +121,23 @@ func (session *ClientCommandSession) Do(rawUrl string) error {
 	return session.doContext(ctx, rawUrl)
 }
 
-func (session *ClientCommandSession) WaitChan() <-chan error {
-	return session.waitChan
+// ---------------------------------------------------------------------------------------------------------------------
+// IClientSessionLifecycle interface
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Dispose 文档请参考： IClientSessionLifecycle interface
+//
+func (session *ClientCommandSession) Dispose() error {
+	return session.dispose(nil)
 }
 
-func (session *ClientCommandSession) Dispose() error {
-	nazalog.Infof("[%s] lifecycle dispose rtsp ClientCommandSession. session=%p", session.uniqueKey, session)
-	if session.conn == nil {
-		return base.ErrSessionNotStarted
-	}
-	return session.conn.Close()
+// WaitChan 文档请参考： IClientSessionLifecycle interface
+//
+func (session *ClientCommandSession) WaitChan() <-chan error {
+	return session.conn.Done()
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 func (session *ClientCommandSession) WriteInterleavedPacket(packet []byte, channel int) error {
 	if session.conn == nil {
@@ -224,9 +228,11 @@ func (session *ClientCommandSession) doContext(ctx context.Context, rawUrl strin
 
 	select {
 	case <-ctx.Done():
+		_ = session.dispose(nil)
 		return ctx.Err()
 	case err := <-errChan:
 		if err != nil {
+			_ = session.dispose(err)
 			return err
 		}
 	}
@@ -236,6 +242,11 @@ func (session *ClientCommandSession) doContext(ctx context.Context, rawUrl strin
 }
 
 func (session *ClientCommandSession) runReadLoop() {
+	var loopErr error
+	defer func() {
+		_ = session.dispose(loopErr)
+	}()
+
 	if !session.methodGetParameterSupported {
 		// TCP模式，需要收取数据进行处理
 		if session.option.OverTcp {
@@ -243,7 +254,7 @@ func (session *ClientCommandSession) runReadLoop() {
 			for {
 				isInterleaved, packet, channel, err := readInterleaved(r)
 				if err != nil {
-					session.waitChan <- err
+					loopErr = err
 					return
 				}
 				if isInterleaved {
@@ -256,7 +267,7 @@ func (session *ClientCommandSession) runReadLoop() {
 		// 接收TCP对端关闭FIN信号
 		dummy := make([]byte, 1)
 		_, err := session.conn.Read(dummy)
-		session.waitChan <- err
+		loopErr = err
 		return
 	}
 
@@ -273,7 +284,7 @@ func (session *ClientCommandSession) runReadLoop() {
 			case <-t.C:
 				session.cseq++
 				if err := session.writeCmd(MethodGetParameter, session.urlCtx.RawUrlWithoutUserInfo, nil, ""); err != nil {
-					session.waitChan <- err
+					loopErr = err
 					return
 				}
 			default:
@@ -282,14 +293,14 @@ func (session *ClientCommandSession) runReadLoop() {
 
 			isInterleaved, packet, channel, err := readInterleaved(r)
 			if err != nil {
-				session.waitChan <- err
+				loopErr = err
 				return
 			}
 			if isInterleaved {
 				session.observer.OnInterleavedPacket(packet, int(channel))
 			} else {
 				if _, err := nazahttp.ReadHttpResponseMessage(r); err != nil {
-					session.waitChan <- err
+					loopErr = err
 					return
 				}
 			}
@@ -302,7 +313,7 @@ func (session *ClientCommandSession) runReadLoop() {
 		case <-t.C:
 			session.cseq++
 			if _, err := session.writeCmdReadResp(MethodGetParameter, session.urlCtx.RawUrlWithoutUserInfo, nil, ""); err != nil {
-				session.waitChan <- err
+				loopErr = err
 				return
 			}
 		default:
@@ -361,13 +372,12 @@ func (session *ClientCommandSession) writeDescribe() error {
 		return err
 	}
 
-	sdpLogicCtx, err := sdp.ParseSdp2LogicContext(ctx.Body)
+	sdpCtx, err := sdp.ParseSdp2LogicContext(ctx.Body)
 	if err != nil {
 		return err
 	}
-	session.rawSdp = ctx.Body
-	session.sdpLogicCtx = sdpLogicCtx
-	session.observer.OnDescribeResponse(session.rawSdp, session.sdpLogicCtx)
+	session.sdpCtx = sdpCtx
+	session.observer.OnDescribeResponse(session.sdpCtx)
 	return nil
 }
 
@@ -375,13 +385,13 @@ func (session *ClientCommandSession) writeAnnounce() error {
 	headers := map[string]string{
 		HeaderAccept: HeaderAcceptApplicationSdp,
 	}
-	_, err := session.writeCmdReadResp(MethodAnnounce, session.urlCtx.RawUrlWithoutUserInfo, headers, string(session.rawSdp))
+	_, err := session.writeCmdReadResp(MethodAnnounce, session.urlCtx.RawUrlWithoutUserInfo, headers, string(session.sdpCtx.RawSdp))
 	return err
 }
 
 func (session *ClientCommandSession) writeSetup() error {
-	if session.sdpLogicCtx.HasVideoAControl() {
-		uri := session.sdpLogicCtx.MakeVideoSetupUri(session.urlCtx.RawUrlWithoutUserInfo)
+	if session.sdpCtx.HasVideoAControl() {
+		uri := session.sdpCtx.MakeVideoSetupUri(session.urlCtx.RawUrlWithoutUserInfo)
 		if session.option.OverTcp {
 			if err := session.writeOneSetupTcp(uri); err != nil {
 				return err
@@ -393,8 +403,8 @@ func (session *ClientCommandSession) writeSetup() error {
 		}
 	}
 	// can't else if
-	if session.sdpLogicCtx.HasAudioAControl() {
-		uri := session.sdpLogicCtx.MakeAudioSetupUri(session.urlCtx.RawUrlWithoutUserInfo)
+	if session.sdpCtx.HasAudioAControl() {
+		uri := session.sdpCtx.MakeAudioSetupUri(session.urlCtx.RawUrlWithoutUserInfo)
 		if session.option.OverTcp {
 			if err := session.writeOneSetupTcp(uri); err != nil {
 				return err
@@ -556,4 +566,17 @@ func (session *ClientCommandSession) writeCmdReadResp(method, uri string, header
 
 	err = ErrRtsp
 	return
+}
+
+func (session *ClientCommandSession) dispose(err error) error {
+	var retErr error
+	session.disposeOnce.Do(func() {
+		nazalog.Infof("[%s] lifecycle dispose rtsp ClientCommandSession. session=%p", session.uniqueKey, session)
+		if session.conn == nil {
+			retErr = base.ErrSessionNotStarted
+			return
+		}
+		retErr = session.conn.Close()
+	})
+	return retErr
 }

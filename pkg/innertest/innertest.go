@@ -127,7 +127,7 @@ func InnerTestEntry(t *testing.T) {
 			assert.Equal(t, nil, err)
 			httpflvPullTagCount.Increment()
 		})
-		nazalog.Error(err)
+		nazalog.Assert(nil, err)
 	}()
 
 	time.Sleep(200 * time.Millisecond)
@@ -143,8 +143,7 @@ func InnerTestEntry(t *testing.T) {
 		}
 		assert.Equal(t, nil, err)
 		fileTagCount.Increment()
-		msg := remux.FlvTag2RtmpMsg(tag)
-		chunks := rtmp.Message2Chunks(msg.Payload, &msg.Header)
+		chunks := remux.FlvTag2RtmpChunks(tag)
 		err = pushSession.Write(chunks)
 		assert.Equal(t, nil, err)
 	}
